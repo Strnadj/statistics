@@ -1,3 +1,5 @@
+require 'active_record'
+
 module Statistics
   class << self
     def included(base)
