@@ -1,3 +1,5 @@
+require "retriable"
+
 module Statistics
   class << self
     def included(base)
@@ -46,12 +48,12 @@ module Statistics
     #    define_statistic "Custom Filter", :count => :all, :filter_on => { :channel => 'channel = ?', :start_date => 'DATE(created_at) > ?' }
     #    define_statistic "Cached", :count => :all, :filter_on => { :channel => 'channel = ?', :blah => 'blah = ?' }, :cache_for => 1.second
     #  end
-    def define_statistic(name, options)
-      method_name = name.to_s.gsub(" ", "").underscore + "_stat"
+    def define_statistic(stat_name, options)
+      method_name = stat_name.to_s.gsub(" ", "").underscore + "_stat"
 
       @statistics ||= {}
       @filter_all_on ||= ActiveRecord::Base.instance_eval { @filter_all_on }
-      @statistics[name] = method_name
+      @statistics[stat_name] = method_name
 
       options = { :column_name => :id }.merge(options)
 
@@ -60,45 +62,46 @@ module Statistics
 
       # We must use the metaclass here to metaprogrammatically define a class method
       (class<<self; self; end).instance_eval do
-        define_method(method_name) do |filters|
-          # check the cache before running a query for the stat
-          # TODO: Better TIME RANGE support when caching requests!
-          cached_val = Rails.cache.read("#{self.name}#{method_name}#{filters}") if options[:cache_for]
-          return cached_val unless cached_val.nil?
+        define_method("build_sql_frag") do |key, value, base_query|
+          if Statistics::supported_time_ranges.include? key
+            # In key is time_range type and in key is FIELD
+            range = nil
+            case key
+            when :range_today then
+              range = Time.now.all_day
+            when :range_week
+              range = Time.now.all_week
+            when :range_month then
+              range = Time.now.all_month
+            when :range_year then
+              range = Time.now.all_year
+            end
 
-          scoped_options = Marshal.load(Marshal.dump(options))
+            # Set value and BETWEEN
+            sql = { value.to_sym => range }
+          elsif base_query == :default
+            sql = { key.to_sym => value }
+          elsif base_query == :day_range
+            sql = { key.to_sym => value.beginning_of_day..value.end_of_day }
+          elsif base_query.is_a?(Array)
+            sql = build_sql_frag(base_query[0], value, base_query[1])
+          else
+            sql = base_query.gsub("?", "'#{value}'")
+            sql = sql.gsub("%t", "#{table_name}")
+          end
+          sql
+        end
 
+        define_method("#{stat_name}_query") do |filters|
+          scoped_options = Marshal.load(Marshal.dump(options.except(:cache_for, :joins)))
+
+          filter_conditions = []
           filters.each do |key, value|
             unless value.nil?
-              if Statistics::supported_time_ranges.include? key
-                # In key is time_range type and in key is FIELD
-                range = nil
-                case key
-                  when :range_today then
-                    range = Time.now.all_day
-                  when :range_week
-                    range = Time.now.all_week
-                  when :range_month then
-                    range = Time.now.all_month
-                  when :range_year then
-                    range = Time.now.all_year
-                end
-
-                # Set value and BETWEEN
-                sql = { value.to_sym => range }
-              else
-                sql = ((@filter_all_on || {}).merge(scoped_options[:filter_on] || {}))[key].gsub("?", "'#{value}'")
-                sql = sql.gsub("%t", "#{table_name}")
-              end
-
-              sql_frag = send(:sanitize_sql_for_conditions, sql)
-
-              case
-                when sql_frag.nil? then nil
-                when scoped_options[:conditions].nil? then scoped_options[:conditions] = sql_frag
-                when scoped_options[:conditions].is_a?(Array) then scoped_options[:conditions][0].concat(" AND #{sql_frag}")
-                when scoped_options[:conditions].is_a?(String) then scoped_options[:conditions].concat(" AND #{sql_frag}")
-              end
+              base_query = ((@filter_all_on || {}).merge(scoped_options[:filter_on] || {}))[key]
+              raise "Invalidate key #{key}" if base_query.blank? && !Statistics::supported_time_ranges.include?(key)
+              sql = build_sql_frag(key, value, base_query)
+              filter_conditions << sql
             end
           end if filters.is_a?(Hash)
 
@@ -108,10 +111,45 @@ module Statistics
           scopes.each do |scope|
             base = base.send(scope)
           end if scopes != [:all]
-          stat_value = base.send(calculation, scoped_options[:column_name], sql_options(scoped_options))
+          stat_value = base
 
+          if joins_opt = options[:joins]
+            joins_opt = joins_opt.is_a?(Proc) ? joins_opt.call(filters) : joins_opt
+            stat_value = stat_value.joins(joins_opt)
+          end
+
+          if (conditions = sql_options(scoped_options)[:conditions]).present?
+            if conditions.is_a?(Array)
+              conditions.each do |condition|
+                stat_value = stat_value.where(condition)
+              end
+            else
+              stat_value = stat_value.where(conditions)
+            end
+          end
+
+          if filter_conditions.present?
+            filter_conditions.each do |condition|
+              stat_value = stat_value.where(condition)
+            end
+          end
+          stat_value
+        end
+
+        define_method(method_name) do |filters|
+          # check the cache before running a query for the stat
+          cache_for = options[:cache_for]
+          cache_key = "#{self.name}#{method_name}#{filters}"
+          cached_val = Rails.cache.read(cache_key) if cache_for
+          return cached_val unless cached_val.nil?
+
+          column_name = options[:column_name]
+          stat_value = send("#{stat_name}_query", filters).send(calculation, column_name)
           # cache stat value
-          Rails.cache.write("#{self.name}#{method_name}#{filters}", stat_value, :expires_in => options[:cache_for]) if options[:cache_for]
+          if cache_for
+            expires_in = cache_for.is_a?(Proc) ? cache_for.call(filters) : cache_for
+            Rails.cache.write(cache_key, stat_value, expires_in: expires_in)
+          end
 
           stat_value
         end
@@ -166,7 +204,29 @@ module Statistics
     # MockModel.get_stat('Basic Count')
     # MockModel.get_stat('Basic Count', :user_type => 'registered', :user_status => 'active')
     def get_stat(stat_name, filters = {})
-      send(@statistics[stat_name], filters) if @statistics[stat_name]
+      errors = []
+      errors << PG::TRSerializationFailure if defined?(PG::TRSerializationFailure)
+      Retriable.retriable(on: errors, tries: 5, base_interval: 1) do
+        send(@statistics[stat_name], filters) if @statistics[stat_name]
+      end
+    end
+
+    def stat_collection(stat_name, filters = {})
+      if @statistics[stat_name]
+        scope = send("#{stat_name}_query", filters)
+        scope = scope.all unless scope.respond_to?(:klass)
+        scope
+      end
+    end
+
+    def clear_stat_cache(stat_name, filters={})
+      method_name = stat_name.to_s.gsub(" ", "").underscore + "_stat"
+      Rails.cache.delete("#{self.name}#{method_name}#{filters}")
+    end
+
+    def get_stat!(stat_name, filters={})
+      clear_stat_cache(stat_name, filters)
+      get_stat(stat_name, filters)
     end
 
     # to keep things DRY anything that all statistics need to be filterable by can be defined
@@ -204,3 +264,4 @@ module Statistics
 end
 
 ActiveRecord::Base.send(:include, Statistics)
+
